@@ -1,5 +1,7 @@
 # 🦊 GitLab MR Manager
 
+[English](./README_EN.md) | ภาษาไทย
+
 Desktop app สำหรับติดตาม GitLab Merge Requests ที่รอ review หรือ merge — รองรับ Windows และ macOS
 
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
