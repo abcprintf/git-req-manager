@@ -1,6 +1,6 @@
 import { GitLabClient } from '../shared/gitlab'
-import type { AppState, MergeRequest } from '../shared/types'
-import { getSettings, isConfigured } from './store'
+import type { AppState, GitLabUser, MergeRequest } from '../shared/types'
+import { getSettings, isConfigured, pruneNotifiedMRIds } from './store'
 import { notifyNewMRs, notifyCIPipelineFailed } from './notifier'
 
 type StateChangeCallback = (state: AppState) => void
@@ -8,6 +8,17 @@ type StateChangeCallback = (state: AppState) => void
 let intervalHandle: ReturnType<typeof setInterval> | null = null
 let previousReviewMRIds = new Set<number>()
 let previousPipelineStatuses = new Map<number, MergeRequest['pipelineStatus']>()
+let cachedUser: GitLabUser | null = null
+
+async function fetchPipelinesThrottled(client: GitLabClient, mrs: MergeRequest[], chunkSize = 5): Promise<void> {
+  for (let i = 0; i < mrs.length; i += chunkSize) {
+    const chunk = mrs.slice(i, i + chunkSize)
+    const statuses = await Promise.all(
+      chunk.map((mr) => client.getMRPipelines(mr.projectId, mr.iid))
+    )
+    chunk.forEach((mr, j) => { mr.pipelineStatus = statuses[j] })
+  }
+}
 
 const currentState: AppState = {
   myReviewMRs: [],
@@ -48,23 +59,20 @@ export async function syncNow(): Promise<void> {
     const settings = getSettings()
     const client = new GitLabClient(settings.gitlabUrl, settings.accessToken)
 
-    const user = await client.getCurrentUser()
+    const user = cachedUser ?? (cachedUser = await client.getCurrentUser())
     currentState.currentUser = user
 
     const [reviewMRs, allOpenMRs] = await Promise.all([
-      client.getMRsForReview(user.id),
+      client.getMRsForReview(user.id).then(async (mrs) => {
+        await fetchPipelinesThrottled(client, mrs)
+        return mrs
+      }),
       client.getAllOpenMRs(settings.projectIds),
     ])
 
-    // Fetch pipeline status for review MRs (limit API calls to reviews only)
-    const pipelineStatuses = await Promise.all(
-      reviewMRs.map((mr) => client.getMRPipelines(mr.projectId, mr.iid))
-    )
-
-    // Attach pipeline status and detect running→failed transitions
+    // Detect running→failed pipeline transitions
     const ciFailures: MergeRequest[] = []
-    reviewMRs.forEach((mr, i) => {
-      mr.pipelineStatus = pipelineStatuses[i]
+    reviewMRs.forEach((mr) => {
       const prev = previousPipelineStatuses.get(mr.id)
       if (prev === 'running' && mr.pipelineStatus === 'failed') {
         ciFailures.push(mr)
@@ -84,6 +92,10 @@ export async function syncNow(): Promise<void> {
     currentState.allOpenMRs = allOpenMRs
     currentState.lastSyncedAt = new Date().toISOString()
     currentState.error = null
+
+    // Prune notifiedMRIds to only active open MRs (cap 500) to prevent unbounded growth
+    const activeMRIds = new Set([...reviewMRs, ...allOpenMRs].map((mr) => mr.id))
+    pruneNotifiedMRIds(activeMRIds)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     currentState.error = `Sync failed: ${message}`
@@ -109,6 +121,7 @@ export function stopScheduler(): void {
 }
 
 export function restartScheduler(): void {
+  cachedUser = null
   const settings = getSettings()
   startScheduler(settings.refreshIntervalMinutes)
 }
